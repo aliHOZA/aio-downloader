@@ -7,6 +7,12 @@ Scrape public Telegram channels with Playwright.
 - Handles file size limit with archive pages.
 - Deduplicates posts based on (channel, post_id) to prevent repeats.
 - Centers media and shows captions in right‑to‑left (RTL) for Persian.
+- Shows a notice when no new posts are found in an update cycle.
+- Generate absolute GitHub links for pagination (when run in a Git repo).
+- Navigation buttons (top & bottom) styled as clickable buttons.
+- Download links open in a new tab to preserve scroll position.
+- Ignores .webm videos (animations/stickers) to improve media detection.
+- Captions use inline Vazirmatn font (falls back to Tahoma if not installed).
 """
 
 import asyncio
@@ -15,7 +21,7 @@ import os
 import re
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import jdatetime
@@ -39,14 +45,20 @@ HEADERS = {
 
 MSG_START = "<!-- MSG START -->"
 MSG_END   = "<!-- MSG END -->"
+TOP_NAV_START = "<!-- TOP_NAV START -->"
+TOP_NAV_END   = "<!-- TOP_NAV END -->"
 NAV_START = "<!-- NAV START -->"
 NAV_END   = "<!-- NAV END -->"
 
 HEADER_TEMPLATE = f"""\
 # خواننده تلگرام
 
+{TOP_NAV_START}
+{TOP_NAV_END}
+
 {MSG_START}
 {MSG_END}
+
 {NAV_START}
 {NAV_END}
 """
@@ -54,9 +66,57 @@ HEADER_TEMPLATE = f"""\
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+def get_github_base_url():
+    """
+    Return (repo_url, branch) for the current git repository, or (None, None).
+    Uses subprocess to query git.
+    """
+    try:
+        import subprocess
+        # Get remote URL
+        remote = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, cwd=REPO_ROOT
+        ).stdout.strip()
+        if not remote:
+            return None, None
+
+        # Convert SSH to HTTPS if necessary
+        if remote.startswith("git@"):
+            remote = re.sub(r"git@([^:]+):(.+)\.git", r"https://\1/\2", remote)
+        elif remote.endswith(".git"):
+            remote = remote[:-4]
+
+        # Get current branch
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, cwd=REPO_ROOT
+        ).stdout.strip()
+
+        return remote, branch
+    except Exception:
+        return None, None
+
+
+def safe_filename(name: str, max_length: int = 100) -> str:
+    """Truncate filename to a safe length, preserving the extension."""
+    if len(name) <= max_length:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not dot:                     # no extension
+        return name[:max_length]
+    keep = max_length - len(ext) - 4  # room for '...' + dot
+    if keep <= 0:                   # extension itself too long
+        return name[:max_length]
+    prefix = stem[:keep // 2]
+    suffix = stem[-(keep - keep // 2):]
+    return f"{prefix}...{suffix}.{ext}"
+
+
 def load_channels():
     with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def load_state():
     if STATE_FILE.exists():
@@ -64,28 +124,63 @@ def load_state():
             return json.load(f)
     return {}
 
+
 def save_state(state):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def build_nav_footer(next_page_rel: str | None, prev_page_rel: str | None) -> str:
-    lines = []
-    if prev_page_rel:
-        lines.append(f"[صفحه قبل]({prev_page_rel})")
-    if next_page_rel:
-        lines.append(f"[صفحه بعد]({next_page_rel})")
-    if not lines:
-        lines.append("*پایان پیام‌ها*")
-    return "\n\n".join(lines)
 
-def wrap_page(message_block: str, next_rel: str | None, prev_rel: str | None) -> str:
-    nav_footer = build_nav_footer(next_rel, prev_rel)
-    page = HEADER_TEMPLATE.replace(f"{MSG_START}\n{MSG_END}",
-                                   f"{MSG_START}\n{message_block}\n{MSG_END}")
-    page = page.replace(f"{NAV_START}\n{NAV_END}",
-                        f"{NAV_START}\n{nav_footer}\n{NAV_END}")
+def build_nav_buttons(next_page_rel: str | None, prev_page_rel: str | None,
+                      base_url: str | None = None) -> str:
+    """
+    Build navigation buttons as HTML links styled like buttons.
+    Returns empty string if no links.
+    """
+    button_style = (
+        "display:inline-block; padding:6px 12px; margin:0 4px; "
+        "background-color:#2ea44f; color:white; text-decoration:none; "
+        "border-radius:4px; font-weight:bold;"
+    )
+    parts = []
+    if prev_page_rel:
+        href = urljoin(base_url, prev_page_rel) if base_url else prev_page_rel
+        parts.append(f'<a href="{href}" style="{button_style}">صفحه قبل</a>')
+    if next_page_rel:
+        href = urljoin(base_url, next_page_rel) if base_url else next_page_rel
+        parts.append(f'<a href="{href}" style="{button_style}">صفحه بعد</a>')
+    return " ".join(parts) if parts else ""
+
+
+def wrap_page(message_block: str, next_rel: str | None, prev_rel: str | None,
+              base_url: str | None = None) -> str:
+    # Top and bottom navigation
+    nav_buttons = build_nav_buttons(next_rel, prev_rel, base_url=base_url)
+    # Top navigation: place inside a RTL div aligned left (end side)
+    top_nav_div = (
+        f'<div dir="rtl" style="text-align:left; margin-bottom:10px;">{nav_buttons}</div>'
+        if nav_buttons else ""
+    )
+    # Bottom navigation similarly
+    bottom_nav_div = (
+        f'<div dir="rtl" style="text-align:left; margin-top:10px;">{nav_buttons}</div>'
+        if nav_buttons else ""
+    )
+
+    page = HEADER_TEMPLATE.replace(
+        f"{TOP_NAV_START}\n{TOP_NAV_END}",
+        f"{TOP_NAV_START}\n{top_nav_div}\n{TOP_NAV_END}"
+    )
+    page = page.replace(
+        f"{MSG_START}\n{MSG_END}",
+        f"{MSG_START}\n{message_block}\n{MSG_END}"
+    )
+    page = page.replace(
+        f"{NAV_START}\n{NAV_END}",
+        f"{NAV_START}\n{bottom_nav_div}\n{NAV_END}"
+    )
     return page
+
 
 def extract_message_md(md_text: str) -> str | None:
     start = md_text.find(MSG_START)
@@ -93,6 +188,7 @@ def extract_message_md(md_text: str) -> str | None:
     if start == -1 or end == -1:
         return None
     return md_text[start + len(MSG_START):end].strip()
+
 
 def get_existing_archives():
     archives = []
@@ -105,6 +201,7 @@ def get_existing_archives():
             archives.append((int(m.group(1)), f))
     archives.sort(key=lambda x: x[0])
     return archives
+
 
 def parse_post_header(header_line: str):
     line = header_line.strip()
@@ -121,6 +218,7 @@ def parse_post_header(header_line: str):
         return m.group(1).strip(), None
     return None, None
 
+
 def deduplicate_messages(old_block: str, new_ids_set: set[tuple[str, int]]) -> str:
     parts = re.split(r"(?=\n## )", old_block)
     kept = []
@@ -132,27 +230,60 @@ def deduplicate_messages(old_block: str, new_ids_set: set[tuple[str, int]]) -> s
         kept.append(part)
     return "".join(kept)
 
+
 # ----------------------------------------------------------------------
 # Media download
 # ----------------------------------------------------------------------
-def download_media(url, channel_name, post_id, filename=None):
+def download_media(url, channel_name, post_id, media_type='photo', filename=None):
     CONTENT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --- choose initial extension based on media_type ---
+    ext_map = {'photo': '.jpg', 'video': '.mp4', 'document': '.dat'}
     if filename is None:
-        ext = ".jpg"
-        if any(k in url.lower() for k in [".mp4", "video", "stream"]):
-            ext = ".mp4"
+        ext = ext_map.get(media_type, '.jpg')
         local_name = f"{channel_name}_{post_id}_{int(time.time())}{ext}"
     else:
+        if len(filename) > 100:
+            filename = safe_filename(filename, max_length=100)
         local_name = filename
+
     local_path = CONTENT_DIR / local_name
+
     try:
         resp = requests.get(url, headers=HEADERS, timeout=30)
         resp.raise_for_status()
+
+        # --- use Content-Type to correct the extension ---
+        content_type = resp.headers.get('Content-Type', '').lower()
+        ext_map_mime = {
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/webp': '.webp',
+            'video/mp4': '.mp4',
+            'video/webm': '.webm',
+            'video/quicktime': '.mov',
+            'application/pdf': '.pdf',
+            # add more if needed
+        }
+        correct_ext = None
+        for mime, extension in ext_map_mime.items():
+            if mime in content_type:
+                correct_ext = extension
+                break
+
+        if correct_ext and not local_name.endswith(correct_ext):
+            new_local_name = str(Path(local_name).stem) + correct_ext
+            local_path = CONTENT_DIR / new_local_name
+            local_name = new_local_name
+            print(f"    ℹ️ Corrected extension -> {local_name}")
+
         local_path.write_bytes(resp.content)
         return f"telegram/content/{local_name}"
+
     except Exception as e:
         print(f"    ⚠️ Media download failed: {e}")
         return None
+
 
 def download_document(post_url, channel_name, post_id):
     print(f"    📄 Fetching document page: {post_url}")
@@ -161,7 +292,10 @@ def download_document(post_url, channel_name, post_id):
         resp.raise_for_status()
         html = resp.text
 
-        match = re.search(r'<a\s[^>]*class="tgme_widget_message_document_wrap"[^>]*\shref="([^"]+)"', html)
+        match = re.search(
+            r'<a\s[^>]*class="tgme_widget_message_document_wrap"[^>]*\shref="([^"]+)"',
+            html
+        )
         if not match:
             print("    ⚠️ No document download link found on the post page.")
             return None
@@ -169,28 +303,43 @@ def download_document(post_url, channel_name, post_id):
         if doc_url.startswith("/"):
             doc_url = "https://t.me" + doc_url
 
-        filename = None
+        # Try to get a meaningful filename
         parsed = urlparse(doc_url)
         path = parsed.path
         if path and "/" in path:
             potential_name = path.split("/")[-1]
-            if "." in potential_name:
-                filename = potential_name
-        if not filename:
+            if potential_name:
+                filename = safe_filename(potential_name, max_length=100)
+            else:
+                filename = None
+        else:
+            filename = None
+
+        # Fallback
+        if not filename or not any(c in filename for c in (".", "_")):
             ext = ".dat"
             filename = f"{channel_name}_{post_id}_{int(time.time())}{ext}"
 
         print(f"    ⬇️ Downloading document: {doc_url} -> {filename}")
-        return download_media(doc_url, channel_name, post_id, filename=filename)
+        return download_media(doc_url, channel_name, post_id,
+                              media_type='document', filename=filename)
 
     except Exception as e:
         print(f"    ⚠️ Document download failed: {e}")
         return None
 
+
 # ----------------------------------------------------------------------
-# Archive shifting
+# Archive shifting with correct pagination & absolute URLs
 # ----------------------------------------------------------------------
-def shift_archives_for_new_page1(message_block_new_page1: str):
+def shift_archives_for_new_page1(message_block_new_page1: str,
+                                 repo_url: str | None, branch: str | None):
+    """
+    Move existing archives up by one, create new archive_1 with the provided block.
+    Navigation: archive_N → next = archive_N+1 (older), prev = archive_N-1 (newer).
+    archive_1 → prev = "../telegram.md" (main page, newer), next = archive_2 (older).
+    Uses absolute GitHub URLs if repo_url/branch are available.
+    """
     CONTENT_DIR.mkdir(parents=True, exist_ok=True)
 
     old_blocks = {}
@@ -208,11 +357,20 @@ def shift_archives_for_new_page1(message_block_new_page1: str):
         if old_path.exists():
             old_path.rename(new_path)
 
+    # Determine base URL for archive files
+    if repo_url and branch:
+        archive_base = f"{repo_url}/blob/{branch}/telegram/content/"
+    else:
+        archive_base = None
+
+    # New archive_1 (oldest of the previously archived content)
     new_page1_path = CONTENT_DIR / "archive_1.md"
-    prev_rel = "archive_2.md" if (2 in [n+1 for n in old_blocks]) else None
+    prev_rel = "../../telegram.md"             # back to main page (newer)
+    next_rel = "archive_2.md" if (2 in [n+1 for n in old_blocks]) else None
     new_page1 = wrap_page(message_block_new_page1,
-                          next_rel="../telegram.md",
-                          prev_rel=prev_rel)
+                          next_rel=next_rel,
+                          prev_rel=prev_rel,
+                          base_url=archive_base)
     new_page1_path.write_text(new_page1, encoding="utf-8")
 
     total_archives = len(old_blocks) + 1
@@ -220,22 +378,31 @@ def shift_archives_for_new_page1(message_block_new_page1: str):
         old_num = new_num - 1
         block = old_blocks.get(old_num, "")
         file_path = CONTENT_DIR / f"archive_{new_num}.md"
-        next_rel = f"archive_{new_num-1}.md"
-        prev_rel = f"archive_{new_num+1}.md" if new_num < total_archives else None
-        page = wrap_page(block, next_rel=next_rel, prev_rel=prev_rel)
+        prev_rel = f"archive_{new_num-1}.md"   # newer
+        next_rel = f"archive_{new_num+1}.md" if new_num < total_archives else None  # older
+        page = wrap_page(block, next_rel=next_rel, prev_rel=prev_rel,
+                         base_url=archive_base)
         file_path.write_text(page, encoding="utf-8")
 
     print(f"✅ Archives shifted: new archive_1 created, total pages = {total_archives}")
 
-def split_main_page(new_entries_block: str, old_messages_block: str):
+
+def split_main_page(new_entries_block: str, old_messages_block: str,
+                    repo_url: str | None, branch: str | None):
+    """
+    Main page too large: keep new entries on main, move old content to archive_1.
+    """
     test_page = wrap_page(new_entries_block, next_rel=None, prev_rel=None)
     if len(test_page.encode("utf-8")) <= 950 * 1024:
-        shift_archives_for_new_page1(old_messages_block)
-        next_rel_main = None
-        prev_rel_main = "telegram/content/archive_1.md"
+        shift_archives_for_new_page1(old_messages_block, repo_url, branch)
+        # Main page: next = archive_1 (older), previous = None
+        next_rel_main = "telegram/content/archive_1.md"
+        prev_rel_main = None
+        main_base = f"{repo_url}/blob/{branch}/" if repo_url and branch else None
         main_page = wrap_page(new_entries_block,
                               next_rel=next_rel_main,
-                              prev_rel=prev_rel_main)
+                              prev_rel=prev_rel_main,
+                              base_url=main_base)
         OUTPUT_FILE.write_text(main_page, encoding="utf-8")
         print("✅ Main page updated, old content moved to archive_1.md")
     else:
@@ -243,10 +410,12 @@ def split_main_page(new_entries_block: str, old_messages_block: str):
         half = len(new_entries_block) // 2
         head_block = new_entries_block[:half]
         tail_block = new_entries_block[half:]
-        shift_archives_for_new_page1(old_messages_block)
-        main_page = wrap_page(head_block, next_rel=None, prev_rel="telegram/content/archive_1.md")
+        shift_archives_for_new_page1(old_messages_block, repo_url, branch)
+        main_page = wrap_page(head_block, next_rel=None,
+                              prev_rel="telegram/content/archive_1.md")
         OUTPUT_FILE.write_text(main_page, encoding="utf-8")
         print("⚠️ Some new messages may be lost due to size limit.")
+
 
 # ----------------------------------------------------------------------
 # Scraping
@@ -282,24 +451,58 @@ async def scrape_channel_all(page, channel_name, last_id, max_scrolls):
                 const text = textEl ? textEl.innerText : '';
 
                 let mediaUrl = null, mediaType = null;
-                const photoWrap = el.querySelector('.tgme_widget_message_photo_wrap');
-                if (photoWrap) {
-                    const style = photoWrap.getAttribute('style') || '';
-                    const match = style.match(/url\\('(.*?)'\\)/);
-                    if (match) { mediaUrl = match[1]; mediaType = 'photo'; }
+
+                // 1) Video element – most reliable
+                const videoTag = el.querySelector('video');
+                if (videoTag && videoTag.src && !videoTag.src.startsWith('blob:')) {
+                    mediaUrl = videoTag.src;
+                    mediaType = 'video';
                 }
+
+                // 2) Video wrapper (alternative)
                 if (!mediaUrl) {
-                    const videoTag = el.querySelector('video');
-                    if (videoTag && videoTag.src) { mediaUrl = videoTag.src; mediaType = 'video'; }
+                    const videoWrap = el.querySelector('.tgme_widget_message_video_wrap');
+                    if (videoWrap) {
+                        const vid = videoWrap.querySelector('video');
+                        if (vid && vid.src && !vid.src.startsWith('blob:')) {
+                            mediaUrl = vid.src;
+                            mediaType = 'video';
+                        } else {
+                            // fallback: maybe a background image (poster)
+                            const style = videoWrap.getAttribute('style') || '';
+                            const match = style.match(/url\\('(.*?)'\\)/);
+                            if (match) { mediaUrl = match[1]; mediaType = 'video'; }
+                        }
+                    }
                 }
+
+                // 3) Photo wrap
                 if (!mediaUrl) {
-                    const linkPhoto = el.querySelector('a.tgme_widget_message_photo_wrap');
-                    if (linkPhoto) {
-                        const style = linkPhoto.getAttribute('style') || '';
+                    const photoWrap = el.querySelector('.tgme_widget_message_photo_wrap');
+                    if (photoWrap) {
+                        const style = photoWrap.getAttribute('style') || '';
                         const match = style.match(/url\\('(.*?)'\\)/);
                         if (match) { mediaUrl = match[1]; mediaType = 'photo'; }
                     }
                 }
+
+                // 4) Photo wrap inside a link (video with cover)
+                if (!mediaUrl) {
+                    const linkPhoto = el.querySelector('a.tgme_widget_message_photo_wrap');
+                    if (linkPhoto) {
+                        const videoInside = linkPhoto.querySelector('video');
+                        if (videoInside && videoInside.src && !videoInside.src.startsWith('blob:')) {
+                            mediaUrl = videoInside.src;
+                            mediaType = 'video';
+                        } else {
+                            const style = linkPhoto.getAttribute('style') || '';
+                            const match = style.match(/url\\('(.*?)'\\)/);
+                            if (match) { mediaUrl = match[1]; mediaType = 'photo'; }
+                        }
+                    }
+                }
+
+                // 5) Document
                 if (!mediaUrl) {
                     const docWrap = el.querySelector('a.tgme_widget_message_document_wrap');
                     if (docWrap) {
@@ -353,6 +556,7 @@ async def scrape_channel_all(page, channel_name, last_id, max_scrolls):
     filtered.sort(key=lambda x: x["id"], reverse=True)
     return filtered
 
+
 # ----------------------------------------------------------------------
 async def main():
     channels = load_channels()
@@ -383,6 +587,15 @@ async def main():
 
         await browser.close()
 
+    # ---- Block .webm video (animated stickers/emojis) ----
+    for m in all_messages:
+        if m.get("media_type") == "video" and m.get("media_url", "").lower().endswith(".webm"):
+            m["media_url"] = None
+            m["media_type"] = None
+
+    # ---- Obtain repository info for absolute links ----
+    repo_url, branch = get_github_base_url()
+
     # ---- Update timestamp header ----
     now_jalali = jdatetime.datetime.now(IRAN_TZ)
     update_header = f"\n---\n📅 بروزرسانی: {now_jalali.strftime('%Y/%m/%d %H:%M')}\n---\n\n"
@@ -401,34 +614,42 @@ async def main():
         media_url = msg.get("media_url")
 
         if media_url and media_type in ("photo", "video"):
-            media_md = download_media(media_url, ch, pid)
+            media_md = download_media(media_url, ch, pid, media_type=media_type)
         elif media_url and media_type == "document":
             media_md = download_document(media_url, ch, pid)
             if not media_md:
-                media_md = media_url  # fallback
+                media_md = media_url  # fallback link
 
-        # ---- Centered media & RTL caption ----
+        # ---- Centered media & RTL caption with Vazirmatn font ----
         header = f"## {ch} — post {pid}\n\n"
         media_html = ""
         if media_md:
             if media_type == "photo":
                 media_html = f'<div align="center">\n  <img src="{media_md}" alt="Photo">\n</div>'
             elif media_type == "video":
-                media_html = f'<div align="center">\n  <a href="{media_md}">🎬 Download video</a>\n</div>'
+                media_html = f'<div align="center">\n  <a href="{media_md}" target="_blank">🎬 Download video</a>\n</div>'
             elif media_type == "document":
-                media_html = f'<div align="center">\n  <a href="{media_md}">📎 Download file</a>\n</div>'
+                media_html = f'<div align="center">\n  <a href="{media_md}" target="_blank">📎 Download file</a>\n</div>'
 
         caption = msg.get("text", "")
         if not caption:
             if media_type == "photo": caption = "📷 Photo"
             elif media_type == "video": caption = "🎬 Video"
             elif media_type == "document": caption = "📎 Document"
-        caption_div = f'<div dir="rtl">\n{caption}\n</div>' if caption else ""
+
+        # Inline RTL + Vazirmatn font, fallback to Tahoma
+        caption_style = "dir='rtl' style='font-family: \"Vazirmatn\", Tahoma, sans-serif;'"
+        caption_div = f'<div {caption_style}>\n{caption}\n</div>' if caption else ""
 
         entry = header + media_html + "\n" + caption_div + "\n\n"
         new_entries_list.append(entry)
 
     new_entries_block = update_header + "".join(new_entries_list)
+
+    # ---- If no new posts were fetched, show a notice ----
+    if not new_entries_list:
+        caption_style = "dir='rtl' style='font-family: \"Vazirmatn\", Tahoma, sans-serif;'"
+        new_entries_block += f'<div {caption_style}>\nهیچ پیام جدیدی در این بروزرسانی ارسال نشد.\n</div>\n\n'
 
     # ---- Load and deduplicate existing messages ----
     old_messages_block = ""
@@ -447,26 +668,36 @@ async def main():
     if old_messages_block.strip() and new_ids_set:
         old_messages_block = deduplicate_messages(old_messages_block, new_ids_set)
 
-    # ---- Combine and handle size limit ----
+    # ---- Combine and handle size limit, with correct pagination ----
     if new_entries_block or old_messages_block:
+        # Determine base URL for the main page
+        main_base = f"{repo_url}/blob/{branch}/" if repo_url and branch else None
+
         trial_page = wrap_page(new_entries_block + old_messages_block,
-                               next_rel=None, prev_rel=None)
+                               next_rel=None, prev_rel=None,
+                               base_url=main_base)
         size = len(trial_page.encode("utf-8"))
         if size > 950 * 1024 and old_messages_block.strip():
-            split_main_page(new_entries_block, old_messages_block)
+            # Split: new entries on main, old goes to archive_1
+            split_main_page(new_entries_block, old_messages_block,
+                            repo_url, branch)
         else:
+            # No split needed, all content on main page
             archives = get_existing_archives()
-            prev_rel_main = None
+            next_rel_main = None
             if archives:
-                prev_rel_main = f"telegram/content/archive_{archives[0][0]}.md"
+                # Main page → next = first archive (older)
+                next_rel_main = f"telegram/content/archive_{archives[0][0]}.md"
             main_page = wrap_page(new_entries_block + old_messages_block,
-                                  next_rel=None,
-                                  prev_rel=prev_rel_main)
+                                  next_rel=next_rel_main,
+                                  prev_rel=None,
+                                  base_url=main_base)
             OUTPUT_FILE.write_text(main_page, encoding="utf-8")
             print("✅ Main page updated (no split needed).")
     else:
         if not OUTPUT_FILE.exists():
-            OUTPUT_FILE.write_text(wrap_page("", None, None), encoding="utf-8")
+            OUTPUT_FILE.write_text(wrap_page("", None, None,
+                                             base_url=f"{repo_url}/blob/{branch}/" if repo_url and branch else None))
             print("ℹ️ No messages yet, empty page created.")
 
     # ---- Update state ----
@@ -479,6 +710,7 @@ async def main():
 
     save_state(state)
     print("✅ State saved.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
